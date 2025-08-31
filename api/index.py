@@ -1,24 +1,9 @@
-from flask import Flask, request
-import os, requests
+from http.server import BaseHTTPRequestHandler
 
-app = Flask(__name__)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-def send_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
-
-@app.route("/", methods=["GET"])
-def home():
-    # Vercel maps /api/index -> this "/" inside the function
-    return "Bot is running!"
-
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json()
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "")
-        reply = f"You said: {text}"
-        send_message(chat_id, reply)
-    return "ok"
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    
