@@ -1,9 +1,7 @@
 // /api/index.js
 export default async function handler(req, res) {
-  // Healthcheck endpoint
   if (req.method === 'GET') return res.status(200).send('Bot is running!');
 
-  // Verify Telegram secret header (matches setWebhook&secret_token)
   const secretOk = process.env.TELEGRAM_SECRET
     ? req.headers['x-telegram-bot-api-secret-token'] === process.env.TELEGRAM_SECRET
     : true;
@@ -11,7 +9,6 @@ export default async function handler(req, res) {
   if (req.method !== 'POST' || !secretOk) return res.status(404).send('Not Found');
 
   try {
-    // Read raw body
     const raw = await new Promise((resolve) => {
       let data = '';
       req.on('data', (c) => (data += c));
@@ -22,16 +19,15 @@ export default async function handler(req, res) {
     const chatId = update?.message?.chat?.id;
     const userText = String(update?.message?.text || '').trim();
 
-    let aiText = 'Say something and I will reply.'; // fallback
+    let aiText = 'Say something and I will reply.';
 
     if (userText) {
       const low = userText.toLowerCase();
-      const isGreeting = ['hi','hello','hey','yo','sup','hai'].some(
-        (g) => low === g || low.startsWith(g + ' ')
-      );
 
-      // ---- Greeting → assistant menu ----
-      if (isGreeting) {
+      // Greeting menu only if the whole message is exactly "hi", "hello", etc.
+      const isGreetingOnly = ['hi','hello','hey','yo','sup','hai'].includes(low);
+
+      if (isGreetingOnly) {
         aiText =
           "👋 hey! i’m your assistant.\n\n" +
           "base skills:\n" +
@@ -44,7 +40,7 @@ export default async function handler(req, res) {
           "• draft: <thing>\n" +
           "• or ask me anything fuzzy — i’ll figure it out.";
       }
-      // ---- Quick command routing ----
+      // ---- Brand helpers ----
       else if (low.startsWith('brand colors:') || low.startsWith('palette:')) {
         const vibe = userText.split(':').slice(1).join(':').trim() || 'modern tech';
         aiText = makePalette(vibe);
@@ -61,19 +57,18 @@ export default async function handler(req, res) {
         const name = userText.split(':').slice(1).join(':').trim() || 'Your Brand';
         aiText = websiteOutline(name);
       }
-      // ---- Assistant expansions ----
+      // ---- Assistant helpers ----
       else if (low.startsWith('plan:')) {
         aiText = await callOllama(`Create a concise, prioritized plan:\n${userText.slice(5).trim()}`);
       } else if (low.startsWith('draft:')) {
         aiText = await callOllama(`Draft the requested artifact with clear sections:\n${userText.slice(6).trim()}`);
       }
-      // ---- Default fuzzy → LLM ----
+      // ---- Default → LLM ----
       else {
         aiText = await callOllama(userText);
       }
     }
 
-    // Send Telegram message
     if (chatId && process.env.TELEGRAM_TOKEN) {
       await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
         method: 'POST',
@@ -85,7 +80,7 @@ export default async function handler(req, res) {
     return res.status(200).send('ok');
   } catch (e) {
     console.error('WEBHOOK ERROR', e);
-    return res.status(200).send('ok'); // always ack to stop retries
+    return res.status(200).send('ok');
   }
 }
 
@@ -144,18 +139,15 @@ async function callOllama(prompt) {
 
 /* ------------------- Helpers ------------------- */
 
-// Contrast heuristic
 function contrastNote(hex) {
   const h = hex.replace('#','');
   const r = parseInt(h.slice(0,2),16)/255,
         g = parseInt(h.slice(2,4),16)/255,
         b = parseInt(h.slice(4,6),16)/255;
   const L = 0.2126*r + 0.7152*g + 0.0722*b;
-  const rec = L < 0.5 ? 'Use white text' : 'Use black text';
-  return `${rec}`;
+  return L < 0.5 ? 'Use white text' : 'Use black text';
 }
 
-// Brand palettes
 function makePalette(vibe) {
   const presets = {
     'modern tech': ['#111827','#0EA5E9','#22D3EE','#F1F5F9','#94A3B8'],
@@ -171,7 +163,6 @@ function makePalette(vibe) {
   return out.trim();
 }
 
-// Font pairings
 function suggestFonts(persona) {
   const pairs = [
     { name: 'Modern/Product', head: 'Inter', body: 'Inter', notes: 'Dashboards/apps. 700–900 headings, 400–500 body.' },
@@ -185,7 +176,6 @@ function suggestFonts(persona) {
   return out.trim();
 }
 
-// Logo prompts
 function logoPrompts(brief) {
   const lines = [
     `Minimal symbol, flat vector, ${brief}, single-color mark`,
@@ -197,7 +187,6 @@ function logoPrompts(brief) {
   return `Logo prompt ideas:\n• ${lines.join('\n• ')}`;
 }
 
-// Website outline
 function websiteOutline(name) {
   return [
     `Sitemap for ${name}:`,
