@@ -1,0 +1,6 @@
+{
+  "name": "telegram-agent-backend",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=20" }
+}
