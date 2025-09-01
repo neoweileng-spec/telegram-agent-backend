@@ -1,8 +1,10 @@
 // /api/index.js
 
-// ---- Per-chat runtime settings (ephemeral; replace with KV later) ----
-const settings = new Map(); // key: chatId -> { qa: bool, persona: string, council: bool, councilRoles: string[] }
+// ---- Per-chat runtime settings & memory (ephemeral; replace with KV later) ----
+const settings = new Map(); // chatId -> { qa, persona, council, councilRoles, profile, summary, history: [] }
+const MAX_TURNS = 8;        // keep last N user/assistant messages (per role message = 1 turn)
 
+// ---------- HTTP handler ----------
 export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('Bot is running!');
 
@@ -19,49 +21,50 @@ export default async function handler(req, res) {
     const chatId = update?.message?.chat?.id;
     const userText = String(update?.message?.text || '').trim();
 
-    // default settings
+    // Defaults per chat
     const cfg = settings.get(chatId) || {
       qa: false,
       persona: 'Assistant',
       council: false,
-      councilRoles: ['Assistant','BrandExpert','Copywriter'] // first is lead by default
+      councilRoles: ['Assistant','BrandExpert','Copywriter'],
+      profile: '',          // your company/product/tone
+      summary: '',          // rolling summary
+      history: [],          // [{role:'user'|'assistant', content:string}]
     };
     settings.set(chatId, cfg);
 
     let aiText = 'Say something and I will reply.';
-
     if (userText) {
+      appendHistory(cfg, 'user', userText);        // record user message first
+      await maybeAutosummarise(cfg);               // compress if history long
+
       const low = userText.toLowerCase();
 
-      // --- control commands (no LLM) ---
-      if (low === 'qa on') {
-        cfg.qa = true; settings.set(chatId, cfg);
-        aiText = 'QA reviewer is now ON.';
-      } else if (low === 'qa off') {
-        cfg.qa = false; settings.set(chatId, cfg);
-        aiText = 'QA reviewer is now OFF.';
-      } else if (low === 'council on') {
-        cfg.council = true; settings.set(chatId, cfg);
-        aiText = `Council mode ON. Roles: ${cfg.councilRoles.join(', ')}`;
-      } else if (low === 'council off') {
-        cfg.council = false; settings.set(chatId, cfg);
-        aiText = 'Council mode OFF.';
-      } else if (low.startsWith('council roles:')) {
+      // ----- Local controls (no LLM) -----
+      if (low === 'qa on')          { cfg.qa = true;  settings.set(chatId, cfg); aiText = 'QA reviewer is ON.'; }
+      else if (low === 'qa off')    { cfg.qa = false; settings.set(chatId, cfg); aiText = 'QA reviewer is OFF.'; }
+      else if (low === 'council on'){ cfg.council = true; settings.set(chatId, cfg); aiText = `Council ON. Roles: ${cfg.councilRoles.join(', ')}`; }
+      else if (low === 'council off'){ cfg.council = false; settings.set(chatId, cfg); aiText = 'Council OFF.'; }
+      else if (low.startsWith('council roles:')) {
         const list = userText.split(':').slice(1).join(':').split(',').map(s => s.trim()).filter(Boolean);
         const unknown = list.filter(r => !PERSONAS[r]);
-        if (list.length && unknown.length === 0) {
-          cfg.councilRoles = list; settings.set(chatId, cfg);
-          aiText = `Council roles set: ${cfg.councilRoles.join(', ')}`;
-        } else {
-          aiText = `Unknown role(s): ${unknown.join(', ')}. Valid: ${Object.keys(PERSONAS).join(', ')}`;
-        }
+        aiText = unknown.length ? `Unknown role(s): ${unknown.join(', ')}. Valid: ${Object.keys(PERSONAS).join(', ')}` :
+          (cfg.councilRoles = list, settings.set(chatId, cfg), `Council roles set: ${cfg.councilRoles.join(', ')}`);
       } else if (low.startsWith('persona:')) {
         const p = userText.split(':').slice(1).join(':').trim();
-        if (PERSONAS[p]) { cfg.persona = p; settings.set(chatId, cfg); aiText = `Persona set to ${p}.`; }
-        else aiText = `Unknown persona "${p}". Try: ${Object.keys(PERSONAS).join(', ')}`;
+        aiText = PERSONAS[p] ? (cfg.persona = p, settings.set(chatId, cfg), `Persona set to ${p}.`) :
+          `Unknown persona "${p}". Try: ${Object.keys(PERSONAS).join(', ')}`;
+      } else if (low.startsWith('remember:')) {
+        cfg.profile = userText.split(':').slice(1).join(':').trim();
+        settings.set(chatId, cfg);
+        aiText = 'Got it — I’ll keep that in mind.';
+      } else if (low === 'forget') {
+        cfg.profile = ''; cfg.summary = ''; cfg.history = [];
+        settings.set(chatId, cfg);
+        aiText = 'Cleared conversation memory for this chat.';
       }
 
-      // --- greeting menu only if the entire message is exactly a greeting ---
+      // ----- Greeting menu (only if message is exactly a greeting) -----
       else if (['hi','hello','hey','yo','sup','hai'].includes(low)) {
         aiText =
           "👋 hey! i’m your assistant.\n\n" +
@@ -74,14 +77,16 @@ export default async function handler(req, res) {
           "• plan: <goal>\n" +
           "• draft: <thing>\n\n" +
           "controls:\n" +
+          "• remember: <company/product/tone>\n" +
+          "• forget\n" +
           "• qa on | qa off\n" +
           "• council on | council off\n" +
           "• council roles: Assistant, BrandExpert, Copywriter, ContractWriter\n" +
           "• persona: Assistant | BrandExpert | ContractWriter | Copywriter\n" +
-          "…or ask me anything — I’ll figure it out.";
+          "…or just tell me what you need.";
       }
 
-      // --- fast local brand helpers (no LLM) ---
+      // ----- Fast brand helpers (no LLM) -----
       else if (low.startsWith('brand colors:') || low.startsWith('palette:')) {
         const vibe = userText.split(':').slice(1).join(':').trim() || 'modern tech';
         aiText = makePalette(vibe);
@@ -96,45 +101,52 @@ export default async function handler(req, res) {
         aiText = websiteOutline(name);
       }
 
-      // --- assistant helpers routed to personas ---
+      // ----- Assistant helpers (persona/council aware, with context) -----
       else if (low.startsWith('plan:')) {
-        const prompt = `Create a concise, prioritized plan for: ${userText.slice(5).trim()}`;
+        const ask = `Create a concise, prioritised plan:\n${userText.slice(5).trim()}`;
         aiText = cfg.council
-          ? await councilOrchestrate({ ask: prompt, roles: cfg.councilRoles, qa: cfg.qa })
-          : await generateWithQA({ role: 'Assistant', prompt, qa: cfg.qa });
+          ? await councilOrchestrate({ cfg, ask, qa: cfg.qa })
+          : await generateWithQA({ cfg, role: 'Assistant', ask, qa: cfg.qa });
       } else if (low.startsWith('draft:')) {
-        const prompt = `Draft the requested artifact with clear sections:\n${userText.slice(6).trim()}`;
+        const ask = `Draft the requested artifact with clear sections:\n${userText.slice(6).trim()}`;
         aiText = cfg.council
-          ? await councilOrchestrate({ ask: prompt, roles: cfg.councilRoles, qa: cfg.qa })
-          : await generateWithQA({ role: 'Copywriter', prompt, qa: cfg.qa });
+          ? await councilOrchestrate({ cfg, ask, qa: cfg.qa })
+          : await generateWithQA({ cfg, role: 'Copywriter', ask, qa: cfg.qa });
       }
 
-      // --- default fuzzy path ---
+      // ----- Default fuzzy path (persona/council aware, with context) -----
       else {
-        const prompt = userText;
+        const ask = userText;
         aiText = cfg.council
-          ? await councilOrchestrate({ ask: prompt, roles: cfg.councilRoles, qa: cfg.qa })
-          : await generateWithQA({ role: cfg.persona, prompt, qa: cfg.qa });
+          ? await councilOrchestrate({ cfg, ask, qa: cfg.qa })
+          : await generateWithQA({ cfg, role: cfg.persona, ask, qa: cfg.qa });
       }
     }
 
-    if (chatId && process.env.TELEGRAM_TOKEN) {
-      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: aiText }),
-      });
-    }
+    // Send + record assistant reply
+    await sendTelegram(chatId, aiText);
+    appendHistory(cfg, 'assistant', aiText);
     return res.status(200).send('ok');
+
   } catch (e) {
     console.error('WEBHOOK ERROR', e);
     return res.status(200).send('ok');
   }
 }
 
-/* ------------------- Persona Orchestrator ------------------- */
+// ---------- Telegram send ----------
+async function sendTelegram(chatId, text) {
+  if (!chatId || !process.env.TELEGRAM_TOKEN) return;
+  await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+}
 
-// Registry of specialist system prompts
+/* =================== Orchestrator with CONTEXT =================== */
+
+// Personas with SG-localisation
 const PERSONAS = {
   Assistant: `
 You are a proactive personal assistant for a solo founder.
@@ -147,84 +159,107 @@ Fuzzy queries: ask at most 1 clarifying Q only if essential; otherwise make assu
 Always include next steps or options.
 
 Localisation (Singapore):
-- Use natural Singaporean English. Friendly and human, with a *light* touch of Singlish only when casual—don’t force “lah/leh/lor”.
-- Prefer British spelling (organisation, colour).
-- Currency: SGD written as S$ (e.g., S$49).
-- Dates: DD MMM YYYY (e.g., 05 Sep 2025).
-- Where relevant, reference local context correctly (CPF, MOM, HDB, MAS).`,
+- Natural Singaporean English; light Singlish only when casual.
+- British spelling; currency S$; dates DD MMM YYYY.`,
 
   BrandExpert: `
 You are a brand and identity specialist.
 Deliver colour palettes (HEX + usage), font pairings (Google Fonts, usage notes),
 logo prompt ideas, website outlines w/ copy stubs.
-Be concrete, minimal, and accessible; provide contrast hints and practical guidance.
+Be concrete, minimal, accessible; give contrast hints and practical guidance.
 
-Localisation (Singapore):
-- Natural Singaporean English; keep it professional.
-- British spelling, S$ currency, DD MMM YYYY dates.
-- Light Singlish only if the user’s tone is casual.`,
+Localisation (Singapore): British spelling, S$, DD MMM YYYY; natural SG tone.`,
 
   Copywriter: `
 You are a senior copywriter and comms strategist.
 Write clear, scannable copy. Add subject lines/openers/CTAs when relevant.
 Keep it punchy, benefits-forward, and specific. Offer 2–3 options if helpful.
 
-Localisation (Singapore):
-- Natural SG tone; crisp and friendly.
-- British spelling; S$; DD MMM YYYY.
-- Light Singlish only when the ask is informal.`,
+Localisation (Singapore): British spelling, S$, DD MMM YYYY; natural SG tone.`,
 
   ContractWriter: `
 You are a contract/template drafter (not legal advice).
 Produce short, plain-language templates and clause options.
-Flag assumptions and jurisdiction-sensitive items. Keep it pragmatic and editable by a founder.
+Flag assumptions and jurisdiction-sensitive items. Keep it pragmatic.
 
-Localisation (Singapore):
-- Use neutral professional SG English.
-- British spelling; S$; DD MMM YYYY.
-- If the topic involves local regulation (e.g., CPF, MOM), note common practices and clearly state that this is not legal advice.`,
+Localisation (Singapore): neutral professional SG English; British spelling; S$; DD MMM YYYY.
+If topic involves CPF or MOM, note common practices and that this is not legal advice.`,
 
   Reviewer: `
-You are a meticulous peer reviewer. Task: Given USER ASK and DRAFT, return a
-short, numbered list of concrete improvements (content gaps, structure, tone, risk).
-No meta commentary, no full rewrite, no preambles—just bullets.
-
-Localisation (Singapore):
-- Ensure British spelling, S$, DD MMM YYYY.
-- Encourage natural SG phrasing; avoid heavy or forced Singlish.`,
+You are a meticulous peer reviewer. Given USER ASK + CONTEXT and DRAFT, return
+a short, numbered list of concrete improvements (content gaps, structure, tone, risk).
+No meta commentary, no full rewrite, no preambles—just bullets.`,
 
   Synthesizer: `
 You are a synthesis expert. Merge the peer review points into a single final answer.
-Output ONLY the improved final answer for the user—no meta, no references to reviewers.
-Be clear, actionable, and concise (≤15 lines unless asked).
-
-Localisation (Singapore):
-- Natural SG tone, friendly but professional.
-- Use British spelling, S$ currency, DD MMM YYYY date format.`,
+Output ONLY the improved final answer for the user—no meta/references to reviewers.
+Be clear, actionable, concise (≤15 lines unless asked).`,
 
   QACritic: `
 You are a strict QA reviewer. DO NOT reveal analysis.
 Given the user's ask and FINAL reply, return:
 - "APPROVE"  (if solid), or
 - "REVISE"   on first line, followed by a clean, improved final reply only.
-Check accuracy, clarity, completeness, tone, and next steps. No explanations.
+Check accuracy, clarity, completeness, tone, and next steps.`,
 
-Localisation (Singapore):
-- Confirm British spelling, S$, DD MMM YYYY.
-- If the topic is Singapore-specific, ensure terms (CPF, MOM, HDB, MAS) are correct and the tone suits a local reader.`,
+  Summarizer: `
+You compress chat history into a brief context summary (≤10 lines).
+Keep user goals, constraints, choices, names, and decisions. No fluff.`,
 };
 
+// Build a compact context string from profile, summary, and recent turns
+function buildContext(cfg) {
+  const lines = [];
+  if (cfg.profile) lines.push(`USER PROFILE: ${cfg.profile}`);
+  if (cfg.summary) lines.push(`SUMMARY: ${cfg.summary}`);
+  if (cfg.history.length) {
+    const recent = cfg.history.slice(-MAX_TURNS * 2); // user+assistant
+    lines.push('RECENT MESSAGES:');
+    for (const m of recent) {
+      lines.push(`${m.role.toUpperCase()}: ${m.content}`);
+    }
+  }
+  return lines.join('\n');
+}
 
-// Core single-call with custom system
-async function callOllamaWithSystem(system, prompt) {
+// Append to rolling history and trim
+function appendHistory(cfg, role, content) {
+  if (!content) return;
+  cfg.history.push({ role, content: String(content).slice(0, 1200) }); // cap each entry
+  // Keep at most MAX_TURNS*2 messages (user+assistant)
+  if (cfg.history.length > MAX_TURNS * 2) {
+    cfg.history = cfg.history.slice(-MAX_TURNS * 2);
+  }
+}
+
+// Summarise when history grows (uses LLM once in a while)
+async function maybeAutosummarise(cfg) {
+  if (cfg.history.length < MAX_TURNS * 2) return;
+  // Summarise only if we don't already have a fresh summary this run
+  const ctx = cfg.history.map(m => `${m.role}: ${m.content}`).join('\n').slice(0, 4000);
+  const sum = await callOllamaWithSystem(PERSONAS.Summarizer, `Chat so far:\n${ctx}\n\nReturn a compact context summary.`);
+  if (sum && !sum.startsWith('I hit an error')) {
+    cfg.summary = sum.slice(0, 1200);
+    // After summarising, keep just the last few turns
+    cfg.history = cfg.history.slice(-6);
+  }
+}
+
+// Single-call with system + context
+async function callOllamaWithSystem(system, prompt, ctxText = '') {
   if (!process.env.OLLAMA_URL) return 'LLM not configured (missing OLLAMA_URL).';
+  const composed = ctxText
+    ? `CONTEXT:\n${ctxText}\n\nTASK:\n${prompt}\n\nRespond for the user.`
+    : prompt;
+
   const payload = {
     model: 'llama3.1:8b',
     stream: false,
     system,
-    prompt,
+    prompt: composed,
     options: { temperature: 0.7, top_p: 0.9, repeat_penalty: 1.1, num_ctx: 4096 },
   };
+
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 30_000);
@@ -245,17 +280,20 @@ async function callOllamaWithSystem(system, prompt) {
   }
 }
 
-async function callOllamaRole(roleName, prompt) {
+async function callOllamaRole(roleName, prompt, cfg) {
   const system = PERSONAS[roleName] || PERSONAS.Assistant;
-  return callOllamaWithSystem(system, prompt);
+  const ctx = buildContext(cfg);
+  return callOllamaWithSystem(system, prompt, ctx);
 }
 
-// Classic: single persona + optional QA
-async function generateWithQA({ role, prompt, qa }) {
-  const draft = await callOllamaRole(role, prompt);
+// Single persona + optional QA, with context
+async function generateWithQA({ cfg, role, ask, qa }) {
+  const draft = await callOllamaRole(role, ask, cfg);
   if (!qa) return draft;
-  const qaPrompt = `USER ASK:\n${prompt}\n\nFINAL REPLY (to QA):\n${draft}\n\nFollow your instructions.`;
-  const critique = await callOllamaWithSystem(PERSONAS.QACritic, qaPrompt);
+
+  const ctx = buildContext(cfg);
+  const qaPrompt = `USER ASK:\n${ask}\n\nCONTEXT:\n${ctx}\n\nFINAL REPLY (to QA):\n${draft}\n\nFollow your instructions.`;
+  const critique = await callOllamaWithSystem(PERSONAS.QACritic, qaPrompt, '');
   const head = critique.trim().split('\n')[0].toUpperCase();
   if (head.startsWith('APPROVE')) return draft;
   if (head.startsWith('REVISE')) {
@@ -266,32 +304,34 @@ async function generateWithQA({ role, prompt, qa }) {
   return draft;
 }
 
-// Council pipeline: Draft → Peer Reviews → Synthesis → (optional) QA
-async function councilOrchestrate({ ask, roles, qa }) {
+// Council: Draft → Peer Reviews → Synthesis → (optional) QA, all with context
+async function councilOrchestrate({ cfg, ask, roles, qa }) {
   const distinct = roles.filter((r, i) => roles.indexOf(r) === i && PERSONAS[r]);
   const lead = distinct[0] || 'Assistant';
   const reviewers = distinct.slice(1);
+  const ctx = buildContext(cfg);
 
-  // 1) Lead draft
-  const draft = await callOllamaRole(lead, ask);
+  // 1) Lead draft with context
+  const draft = await callOllamaRole(lead, ask, cfg);
 
-  // 2) Each reviewer returns numbered bullets of improvements
+  // 2) Peer reviews see context + draft
   const reviewPromises = reviewers.map(r => callOllamaWithSystem(
     PERSONAS.Reviewer,
-    `USER ASK:\n${ask}\n\nDRAFT:\n${draft}\n\nReturn only numbered improvement bullets.`
+    `USER ASK:\n${ask}\n\nCONTEXT:\n${ctx}\n\nDRAFT:\n${draft}\n\nReturn only numbered improvement bullets.`,
+    ''
   ));
   const reviews = reviewers.length ? await Promise.all(reviewPromises) : [];
 
-  // 3) Synthesizer merges everything into the final answer
+  // 3) Synthesizer merges into final answer (with context)
   const synthesisPrompt =
-    `USER ASK:\n${ask}\n\nDRAFT:\n${draft}\n\nREVIEWS:\n${reviews.map((rv, i)=>`[${reviewers[i]}]\n${rv}`).join('\n\n')}\n\n` +
-    `Produce ONLY the final improved answer for the user, in ≤15 lines.`;
-  let finalAnswer = await callOllamaWithSystem(PERSONAS.Synthesizer, synthesisPrompt);
+    `USER ASK:\n${ask}\n\nCONTEXT:\n${ctx}\n\nDRAFT:\n${draft}\n\nREVIEWS:\n${reviews.map((rv,i)=>`[${reviewers[i]}]\n${rv}`).join('\n\n')}\n\n` +
+    `Produce ONLY the final improved answer (≤15 lines).`;
+  let finalAnswer = await callOllamaWithSystem(PERSONAS.Synthesizer, synthesisPrompt, '');
 
-  // 4) Optional QA (hidden). Return only final text to user.
+  // 4) Optional QA with context
   if (qa) {
-    const qaPrompt = `USER ASK:\n${ask}\n\nFINAL REPLY (to QA):\n${finalAnswer}\n\nFollow your instructions.`;
-    const critique = await callOllamaWithSystem(PERSONAS.QACritic, qaPrompt);
+    const qaPrompt = `USER ASK:\n${ask}\n\nCONTEXT:\n${ctx}\n\nFINAL REPLY (to QA):\n${finalAnswer}\n\nFollow your instructions.`;
+    const critique = await callOllamaWithSystem(PERSONAS.QACritic, qaPrompt, '');
     const head = critique.trim().split('\n')[0].toUpperCase();
     if (head.startsWith('REVISE')) {
       const lines = critique.split('\n'); lines.shift();
@@ -302,7 +342,7 @@ async function councilOrchestrate({ ask, roles, qa }) {
   return finalAnswer;
 }
 
-/* ------------------- Local Helpers (no LLM) ------------------- */
+/* =================== Local helpers (no LLM) =================== */
 
 function contrastNote(hex) {
   const h = hex.replace('#','');
@@ -333,9 +373,7 @@ function suggestFonts(persona) {
     { name: 'Clean Corporate', head: 'IBM Plex Sans', body: 'IBM Plex Sans', notes: 'Neutral tone, readable docs.' },
   ];
   let out = `Font pairing ideas for "${persona}":\n`;
-  for (const p of pairs) {
-    out += `\n• ${p.name}\n  Headline: ${p.head}\n  Body: ${p.body}\n  Notes: ${p.notes}`;
-  }
+  for (const p of pairs) out += `\n• ${p.name}\n  Headline: ${p.head}\n  Body: ${p.body}\n  Notes: ${p.notes}`;
   return out.trim();
 }
 function logoPrompts(brief) {
