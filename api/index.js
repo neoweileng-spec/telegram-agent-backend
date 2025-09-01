@@ -1,4 +1,4 @@
-// /api/index.js
+// /api/index.js (CommonJS)
 // Freddy (SG) — multi-persona assistant with council + QA + short-term memory
 // Works on Vercel serverless + Telegram webhook + Ollama (non-stream JSON).
 
@@ -30,7 +30,7 @@ const MAX_TURNS = 8; // keep last N user/assistant turns (compact context)
 
 /* =================== HTTP handler =================== */
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('Bot is running!');
 
   const secretOk = process.env.TELEGRAM_SECRET
@@ -157,7 +157,7 @@ export default async function handler(req, res) {
       }
     }
 
-    await sendTelegram(update?.message?.chat?.id, aiText);
+    await sendTelegram(chatId, aiText);
     appendHistory(cfg, 'assistant', aiText);
     return res.status(200).send('ok');
 
@@ -167,6 +167,8 @@ export default async function handler(req, res) {
     return res.status(200).send('ok');
   }
 }
+
+module.exports = handler;
 
 /* =================== Routing with time budget =================== */
 
