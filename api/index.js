@@ -106,24 +106,27 @@ async function handler(req, res) {
 
       // ---------- Greeting menu (exact greetings only) ----------
       else if (['hi','hello','hey','yo','sup','hai'].includes(low)) {
-        aiText =
-          `👋 hey! i’m ${BOT_NAME}.\n\n` +
-          "base skills:\n" +
-          "• brand colors: <vibe>\n" +
-          "• font pairing for <personality>\n" +
-          "• logo prompts: <brief>\n" +
-          "• website outline: <name>\n\n" +
-          "assistant skills:\n" +
-          "• plan: <goal>\n" +
-          "• draft: <thing>\n\n" +
-          "controls:\n" +
-          "• remember: <company/product/tone>\n" +
-          "• forget\n" +
-          "• qa on | qa off\n" +
-          "• council on | council off\n" +
-          "• council roles: Assistant, BrandExpert, Copywriter, ContractWriter\n" +
-          "• persona: Assistant | BrandExpert | ContractWriter | Copywriter\n" +
-          "…tell me what you need and I’ll sort it out.`;
+        aiText = `👋 hey! i’m ${BOT_NAME}.
+
+base skills:
+• brand colors: <vibe>
+• font pairing for <personality>
+• logo prompts: <brief>
+• website outline: <name>
+
+assistant skills:
+• plan: <goal>
+• draft: <thing>
+
+controls:
+• remember: <company/product/tone>
+• forget
+• qa on | qa off
+• council on | council off
+• council roles: Assistant, BrandExpert, Copywriter, ContractWriter
+• persona: Assistant | BrandExpert | ContractWriter | Copywriter
+
+…tell me what you need and I’ll sort it out.`;
       }
 
       // ---------- Fast brand helpers (no LLM) ----------
